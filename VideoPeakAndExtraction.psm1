@@ -111,18 +111,26 @@ function Get-Subclip {
 function Video-FindPeakLevel {
     param(
         [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
-        [string] $InputFile        
+        [string] $InputFile,
+        [Parameter(Mandatory = $false)]
+        [int] $channel = 0,
+        [Parameter(Mandatory = $false)]
+        [switch]$forceOverwrite = $false,
+        [switch] $collect = $false       
     )
     #get the directory from the inputfile and make a log.txt there
-    write-host "*finding peak level for $InputFile"
+    write-host "*finding peak level for $InputFile(channel $channel)"
     $directoryPath = $directoryPath = [System.IO.Path]::GetDirectoryName($InputFile)
     $originalFileName = [System.IO.Path]::GetFileNameWithoutExtension($InputFile)
-    $logname = "logPiekM.json"
+    $logname = "ch$($channel)_logPiekM.json"
     $log = Join-Path $directoryPath $logname
     #  $logT = $log -replace '\\', '\\' -replace ':', '\:'
     #  $logPiek = "'" + $logT + "'"
     $measure = Measure-Command {
-        $re = ffmpeg -stats -hide_banner -loglevel error -i $InputFile -map 0:a:0 -filter:a:0 ebur128=metadata=1,ametadata=mode=print:file='logPiekM.txt'  -f null - #no space after the comma before ametadata" 
+
+        $re = ffmpeg -stats -hide_banner -loglevel error -i $InputFile -map 0:a:$($channel)  -filter:a ebur128=metadata=1,ametadata=mode=print:file='logPiekM.txt'  -f null - #no space after the comma before ametadata" 
+
+        #        $re = ffmpeg -stats -hide_banner -loglevel error -i $InputFile -map 0:a:0 -filter:a:0 ebur128=metadata=1,ametadata=mode=print:file='logPiekM.txt'  -f null - #no space after the comma before ametadata" 
         $res = Get-Content logPiekM.txt | Select-String -Pattern "pts_time", "lavfi.r128.M", "lavfi.r128.LRA", "lavfi.r128.I"  
         #ffmpeg  -stats -loglevel error -i $($InputFile) -filter:a:0 astats=metadata=1:reset=20:length=2,ametadata=print:key=lavfi.astats.Overall.Max_level:file='logPeak.txt' -f null -
 
@@ -135,16 +143,80 @@ function Video-FindPeakLevel {
 
     $result = GetPeakLevel -Array $res #analyse the results of the ffmpeg command
     $output = New-Object PSObject -Property @{
-        InputFile = $InputFile
-        PeakLevel = $result
+        InputFile    = $InputFile
+        audiochannel = @{
+        ($channel.ToString()) = @{
+                PeakLevel = $result
+            }
+        }
     } #turn it into json and save it to a file
-    $output | ConvertTo-Json | Set-Content -Path $checkedFilepath
+    Write-Host "Ch$($Channel) Peak level: $($result.Maxlevel) dB at $($result.timecodeOfPeak) seconds(LRA=$($result.LRA),Integrated=$($result.integradedLevel))"
+    if ($collect -eq $false) {
+        $output | ConvertTo-Json -Depth 4 | Set-Content -Path $checkedFilepath
     
-    Write-Host "Peak level: $($result.Maxlevel) dB at $($result.timecodeOfPeak) seconds(LRA=$($result.LRA),Integrated=$($result.integradedLevel))"
-    Write-Host "saved at $checkedFilepath"
-    return $output
+        Write-Host "saved at $checkedFilepath"
+    }
+    return $output, $checkedFilepath
 }
 
+
+
+<#
+.SYNOPSIS
+    Measures all audio tracks in a video file and saves the results to a JSON file.
+
+.DESCRIPTION
+    The Video-MeasureAllTracks function uses ffprobe to get information about the audio streams in a video file.
+    It then calls the Video-FindPeakLevel function for each audio stream to measure the peak level.
+    The results are saved to a JSON file in the same directory as the input file.
+
+.PARAMETER InputFile
+    The path to the video file to measure. This parameter is mandatory.
+
+.EXAMPLE
+    Video-MeasureAllTracks -InputFile "F:\test\Thor.Love.And.Thunder.2022_hasPeakClip.mkv"
+
+    This command measures all audio tracks in the specified video file and saves the results to a JSON file.
+
+.NOTES
+    The output JSON file is named after the input file with "_Measured_<number of audio streams>Ch.json" appended to the name.
+    The JSON file contains an array of objects, each representing an audio stream in the video file.
+    Each object has properties for the input file name and the results from the Video-FindPeakLevel function.
+#>
+function Video-MeasureAllTracks {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InputFile
+    )
+
+    write-host "*measuring all tracks"
+    $measure = Measure-Command {
+        $ffprobeOutput = & ffprobe -v quiet -print_format json -show_streams $InputFile | ConvertFrom-Json
+        $audioStreams = $ffprobeOutput.streams | Where-Object { $_.codec_type -eq "audio" }
+        $audioStreamsCount = $audioStreams.Count
+        Write-Host "Number of audio streams: $audioStreamsCount"
+        $directoryPath = [System.IO.Path]::GetDirectoryName($InputFile)
+        $filename = [System.IO.Path]::GetFileNameWithoutExtension($InputFile)
+        $filename = $filename + ".json"
+        $Newfilename = Join-Path $directoryPath $filename
+
+        $checkedFilepath = (Get-InputAndOutputPaths -InputFile $Newfilename -ExtraEndString "_Measured_$($audioStreamsCount)Ch").OutPath
+
+        $audioChannels = 0 .. $($audioStreamsCount - 1) | ForEach-Object {
+            Video-FindPeakLevel $InputFile -channel $_ -collect
+        }
+
+        $output = New-Object PSObject -Property @{
+            InputFile     = $InputFile
+            audiochannels = $audioChannels | ForEach-Object { $_.audiochannel }
+        }
+
+        $output | ConvertTo-Json -Depth 4 | Set-Content -Path $checkedFilepath
+    }
+    Write-Host "saved at $checkedFilepath"
+    Write-Host "Video-MeasureAllTracks finished in  $($measure.ToString('hh\:mm\:ss\:fff'))"
+}
+#Video-MeasureAllTracks -InputFile "F:\test\Thor.Love.And.Thunder.2022_hasPeakClip.mkv"
 #helperfunction to check that the start and end times are within the clip
 function Get-StartAndEndTimes {
     param (
@@ -280,6 +352,7 @@ function Video-ExtractPeakClip {
         [string] $InputFile ,
         [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
         [int] $Duration,
+        [int] $channel = 0,
         [Parameter(Mandatory = $false)]
         [bool] $ForceOverwrite = $false      
     )
@@ -292,7 +365,7 @@ function Video-ExtractPeakClip {
     $Extra = "_hasPeak"
     $measure = Measure-Command {
         Get-InputAndOutputPaths -InputFile $InputFile -ExtraEndString $Extra -ForceOverwrite $ForceOverwrite
-        $r = Video-FindPeakLevel $inputfile
+        $r = Video-FindPeakLevel $inputfile -channel $channel
         $times = Get-StartAndEndTimes -InputFile $inputfile -Duration $Duration -Timecode $r.timecode
 
         Get-Subclip -InputFile $inputfile  -StartTime $times.StartTime -Duration $Duration -OutputFile $OutPath
@@ -330,7 +403,9 @@ function Videos-FindPeakLevels {
         [string] $path,
         # extension to filter for mkv ... mp4 ...
         [Parameter(Mandatory = $true)]
-        [string]$extension
+        [string]$extension,
+        [Parameter(Mandatory = $false)]
+        [int] $channel = 0
     )
     Write-Host "*finding peak levels for all videos in $path"
     $extension = "*.{0}" -f $extension
@@ -338,7 +413,7 @@ function Videos-FindPeakLevels {
     $pathtoJson = (Get-InputAndOutputPaths $pathtoJson).OutPath
     $measure = Measure-Command {
         Get-ChildItem -Path $path -Filter $extension  | ForEach-Object {
-            Video-FindPeakLevel -InputFile $_.FullName
+            Video-FindPeakLevel -InputFile $_.FullName -channel $channel
         }  | ConvertTo-Json | Set-Content -Path $pathtoJson }
     write-host "Videos-FindPeakLevels finished in $($measure.ToString('hh\:mm\:ss\:fff'))"
     return $pathtoJson
@@ -351,10 +426,15 @@ function Get-OneSubclipFromJson {
         [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
         $item,
         [Parameter(Mandatory = $true)]
-        $Duration
+        $Duration,
+        [Parameter(Mandatory = $false)]
+        [int] $channel = 0
+
     )
+    write-host "*extracting peak clip from $item.InputFile"
+$channel=$channel.ToString()
     $inputFile = $item.InputFile
-    $peakLevel = $item.PeakLevel
+    $peakLevel = $item.audiochannel.$($channel).PeakLevel
     $times = Get-StartAndEndTimes -InputFile $inputFile -Duration $Duration -Timecode $peakLevel.timecodeOfPeak
     $paths = Get-InputAndOutputPaths -InputFile $inputFile -ExtraEndString "_hasPeakClip" 
 
@@ -381,8 +461,11 @@ function Read-PeakJson {
 
 }
 Export-ModuleMember -Function Get-Subclip, Video-ExtractPeakClip, Video-FindPeakLevel, Videos-FindPeakLevels, Read-PeakJson, Get-OneSubclipFromJson, Get-StartAndEndTimes, Get-InputAndOutputPaths
+#
+#$null, $path = Video-FindPeakLevel -InputFile "F:\test\Thor.Love.And.Thunder.2022_hasPeakClip.mkv"
 
-#Video-FindPeakLevel -InputFile F:\test\The.Wolf.of.Wall.Street.2013_hasPeakClip.mkv
+#Read-PeakJson $path -Duration 60
 #Videos-FindPeakLevels -Path "F:\test" -extension 'mkv'
 #Get-ChildItem F:\test\ -Filter *wolf*json|Read-PeakJson -Duration 600 
 #(get-content -LiteralPath   $((Get-ChildItem F:\test\ -Filter peaklevel*json).FullName) | ConvertFrom-Json) | ? { $_.PeakLevel.LRA -gt 20 } |%{ Get-OneSubclipFromJson $_ -Duration 600}
+#measureall -videofile "F:\test\The.Wolf.of.Wall.Street.2013_hasPeakClip(2).mkv"
